@@ -611,18 +611,18 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
     def parallelize(self, device_map=None):
         self.device_map = (
-            get_device_map(len(self.transformer.layers), range(torch.cuda.device_count()))
+            get_device_map(len(self.gpt_neox.layers), range(torch.cuda.device_count()))
             if device_map is None
             else device_map
         )
-        assert_device_map(self.device_map, len(self.transformer.layers))
-        self.transformer.parallelize(self.device_map)
-        self.embed_out = self.embed_out.to(self.transformer.first_device)
+        assert_device_map(self.device_map, len(self.gpt_neox.layers))
+        self.gpt_neox.parallelize(self.device_map)
+        self.embed_out = self.embed_out.to(self.gpt_neox.first_device)
         self.model_parallel = True
 
     def deparallelize(self):
-        self.transformer.deparallelize()
-        self.transformer = self.transformer.to("cpu")
+        self.gpt_neox.deparallelize()
+        self.gpt_neox = self.gpt_neox.to("cpu")
         self.embed_out = self.embed_out.to("cpu")
         self.model_parallel = False
         torch.cuda.empty_cache()
@@ -705,7 +705,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
         # Set device for model parallelism
         if self.model_parallel:
-            torch.cuda.set_device(self.transformer.first_device)
+            torch.cuda.set_device(self.gpt_neox.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
 
