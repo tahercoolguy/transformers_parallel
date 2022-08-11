@@ -706,7 +706,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.gpt_neox.first_device)
-            hidden_states = hidden_states.to(self.lm_head.weight.device)
+            hidden_states = hidden_states.to(self.embed_out.weight.device)
 
 
         lm_logits = self.embed_out(hidden_states)
