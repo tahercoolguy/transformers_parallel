@@ -611,11 +611,11 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
     def parallelize(self, device_map=None):
         self.device_map = (
-            get_device_map(len(self.transformer.h), range(torch.cuda.device_count()))
+            get_device_map(len(self.transformer.layers), range(torch.cuda.device_count()))
             if device_map is None
             else device_map
         )
-        assert_device_map(self.device_map, len(self.transformer.h))
+        assert_device_map(self.device_map, len(self.transformer.layers))
         self.transformer.parallelize(self.device_map)
         self.embed_out = self.embed_out.to(self.transformer.first_device)
         self.model_parallel = True
