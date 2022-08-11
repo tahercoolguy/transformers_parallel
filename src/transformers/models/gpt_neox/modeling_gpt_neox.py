@@ -31,6 +31,7 @@ from ...file_utils import (
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
 from ...utils import logging
+from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gpt_neox import GPTNeoXConfig
 
 
@@ -54,6 +55,7 @@ class GPTNeoXPreTrainedModel(PreTrainedModel):
 
     config_class = GPTNeoXConfig
     base_model_prefix = "gpt_neox"
+    is_parallelizable = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPTNeoXLayer"]
 
@@ -412,8 +414,40 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         self.layers = nn.ModuleList([GPTNeoXLayer(config) for _ in range(config.num_hidden_layers)])
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
         # Initialize weights and apply final processing
         self.post_init()
+
+    def parallelize(self, device_map=None):
+        # Check validity of device_map
+        self.device_map = (
+            get_device_map(len(self.layers), range(torch.cuda.device_count())) if device_map is None else device_map
+        )
+        assert_device_map(self.device_map, len(self.layers))
+        self.model_parallel = True
+        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
+        self.last_device = "cuda:" + str(max(self.device_map.keys()))
+        self.embed_in = self.embed_in.to(self.first_device)
+        # Load onto devices
+        for k, v in self.device_map.items():
+            for block in v:
+                cuda_device = "cuda:" + str(k)
+                self.layers[block] = self.layers[block].to(cuda_device)
+        # ln_f to last
+        self.final_layer_norm = self.final_layer_norm.to(self.last_device)
+
+    def deparallelize(self):
+        self.model_parallel = False
+        self.device_map = None
+        self.first_device = "cpu"
+        self.last_device = "cpu"
+        self.embed_in = self.wte.to("cpu")
+        for index in range(len(self.layers)):
+            self.layers[index] = self.layers[index].to("cpu")
+        self.final_layer_norm = self.ln_f.to("cpu")
+        torch.cuda.empty_cache()
 
     def get_input_embeddings(self):
         return self.embed_in
@@ -506,6 +540,18 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         for i, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
+
+            # Model parallel
+            if self.model_parallel:
+                torch.cuda.set_device(hidden_states.device)
+                # Ensure layer_past is on same device as hidden_states (might not be correct)
+                if layer_past is not None:
+                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
+                # Ensure that attention_mask is always on the same device as hidden_states
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(hidden_states.device)
+                if isinstance(head_mask, torch.Tensor):
+                    head_mask = head_mask.to(hidden_states.device)
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             outputs = layer(
@@ -521,6 +567,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                 presents = presents + (outputs[1],)
             if output_attentions:
                 all_attentions = all_attentions + (outputs[2 if use_cache else 1],)
+
+            # Model Parallel: If it's the last layer for that device, put things on the next device
+            if self.model_parallel:
+                for k, v in self.device_map.items():
+                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
+                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
         hidden_states = self.final_layer_norm(hidden_states)
         # Add last hidden state
@@ -551,8 +603,29 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         self.gpt_neox = GPTNeoXModel(config)
         self.embed_out = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
         # Initialize weights and apply final processing
         self.post_init()
+
+    def parallelize(self, device_map=None):
+        self.device_map = (
+            get_device_map(len(self.transformer.h), range(torch.cuda.device_count()))
+            if device_map is None
+            else device_map
+        )
+        assert_device_map(self.device_map, len(self.transformer.h))
+        self.transformer.parallelize(self.device_map)
+        self.embed_out = self.embed_out.to(self.transformer.first_device)
+        self.model_parallel = True
+
+    def deparallelize(self):
+        self.transformer.deparallelize()
+        self.transformer = self.transformer.to("cpu")
+        self.embed_out = self.embed_out.to("cpu")
+        self.model_parallel = False
+        torch.cuda.empty_cache()
 
     def get_output_embeddings(self):
         return self.embed_out
@@ -629,6 +702,13 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.transformer.first_device)
+            hidden_states = hidden_states.to(self.lm_head.weight.device)
+
+
         lm_logits = self.embed_out(hidden_states)
 
         lm_loss = None
